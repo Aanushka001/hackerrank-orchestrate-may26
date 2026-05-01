@@ -1,60 +1,113 @@
-"""
-agent.py — Triage agent that classifies, retrieves, and responds to support tickets.
-"""
 import os
 import json
 import re
-import google.generativeai as genai
+from groq import Groq
 from retriever import get_retriever
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = "gemini-2.5-flash"
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+MODEL = "llama-3.1-8b-instant"
+
+ESCALATION_KEYWORDS = [
+    "stolen card", "card stolen", "lost card", "card lost",
+    "block my card", "cancel my card", "replace my card",
+    "unauthorized transaction", "unauthorized charge", "unauthorized access",
+    "fraudulent transaction", "fraudulent charge",
+    "identity theft", "identity stolen",
+    "account hacked", "account compromised", "account breached",
+    "suspicious login", "suspicious activity",
+    "data breach", "security vulnerability", "security exploit",
+    "phishing", "scam email",
+    "legal action", "lawsuit", "gdpr request", "compliance issue",
+    "social security number", "passport number",
+]
+
+KEYWORD_PRODUCT_AREA = {
+    "stolen card": "Card Security",
+    "card stolen": "Card Security",
+    "lost card": "Card Services",
+    "card lost": "Card Services",
+    "unauthorized transaction": "Fraud Prevention",
+    "unauthorized charge": "Fraud Prevention",
+    "fraudulent transaction": "Fraud Prevention",
+    "fraudulent charge": "Fraud Prevention",
+    "unauthorized access": "Account Security",
+    "identity theft": "Identity Protection",
+    "identity stolen": "Identity Protection",
+    "account hacked": "Account Security",
+    "account compromised": "Account Security",
+    "data breach": "Security",
+    "security vulnerability": "Security",
+    "security exploit": "Security",
+    "phishing": "Security",
+    "legal action": "Legal & Compliance",
+    "lawsuit": "Legal & Compliance",
+    "gdpr request": "Legal & Compliance",
+}
+
+
+def pre_escalation_check(issue: str, subject: str) -> dict | None:
+    combined = f"{subject} {issue}".lower()
+    matched = None
+    for kw in ESCALATION_KEYWORDS:
+        if kw in combined:
+            matched = kw
+            break
+    if not matched:
+        return None
+
+    area = KEYWORD_PRODUCT_AREA.get(matched, "Security & Fraud")
+    return {
+        "status": "escalated",
+        "product_area": area,
+        "response": (
+            "Your case has been escalated to our specialized support team. "
+            "A human agent will contact you as soon as possible. "
+            "If this involves a lost or stolen card, please also contact your card issuer "
+            "directly to block it immediately. Do not share sensitive account details here."
+        ),
+        "justification": (
+            f"Pre-escalated: high-risk keyword '{matched}' detected. "
+            "Fraud, security, and card theft issues require human agent handling."
+        ),
+        "request_type": "product_issue",
+    }
+
+
 SYSTEM_PROMPT = """You are a precise support triage agent for a multi-domain help desk covering HackerRank, Claude (AI assistant), and Visa (payment network).
 
-You will receive:
-1. A support ticket (issue + subject + company)
-2. Retrieved corpus excerpts relevant to the issue
-
-Your job is to produce a JSON object with EXACTLY these fields:
+You receive a support ticket and retrieved corpus excerpts. Produce a JSON object with EXACTLY these fields:
 - status: "replied" or "escalated"
-- product_area: the most relevant support category (e.g. "Billing", "Account Access", "Test Integrity", "Fraud Prevention", "Card Services", "AI Features", "Integration", etc.)
-- response: user-facing response (grounded ONLY in the provided corpus; if escalated, explain why and what will happen next)
-- justification: 1-2 sentences explaining your decision and what corpus evidence you used
+- product_area: the most relevant support category (e.g. "Billing", "Account Access", "Test Integrity", "Developer Tools", "Card Services", "AI Features", "Integration", "Subscription", etc.)
+- response: user-facing response grounded ONLY in the provided corpus excerpts
+- justification: 1-2 sentences explaining your decision and which corpus evidence you used
 - request_type: one of "product_issue", "feature_request", "bug", "invalid"
 
-ESCALATION RULES (escalate when ANY of these apply):
-- Fraud, unauthorized transactions, or suspected account compromise
-- Lost/stolen card or identity theft
-- Billing disputes requiring account-level access
-- Security vulnerabilities or data breaches
-- Legal or compliance issues
-- The corpus has NO relevant information to answer the issue
-- The issue involves PII, account credentials, or sensitive personal data
-- The issue is abusive, harmful, or clearly malicious
+ESCALATION RULES — set status=escalated when:
+- Corpus has NO relevant information to answer the issue
+- Issue involves PII or credentials requiring human verification
+- Issue is abusive or clearly malicious
+- Billing dispute requiring account-level access with no self-serve option in corpus
 
-REPLY RULES:
-- General how-to questions answerable from corpus → replied
-- Feature requests with enough context → replied
-- Known bugs with workaround documented → replied
-- Out-of-scope/irrelevant issues → replied with "out of scope" message
+REPLY RULES — set status=replied when:
+- How-to questions answerable from corpus
+- Feature requests (acknowledge and classify)
+- Known bugs with workaround in corpus
+- Out-of-scope or irrelevant issues: reply politely, set request_type=invalid
 
-GROUNDING RULE: Never invent policies or steps not present in the corpus excerpts.
-If the corpus doesn't cover it, say so and escalate or explain the limitation.
+GROUNDING: Use only the provided corpus excerpts. Never invent policies, URLs, or steps. If corpus is insufficient, escalate and explain the gap.
 
-Output ONLY valid JSON. No markdown, no explanation outside JSON."""
+Output ONLY valid JSON. No markdown, no text outside the JSON."""
 
 
-def build_user_prompt(issue: str, subject: str, company: str, corpus_chunks: list[dict]) -> str:
-    corpus_text = ""
-    if corpus_chunks:
-        parts = []
-        for i, c in enumerate(corpus_chunks, 1):
-            parts.append(
-                f"[DOC {i} | {c['company']} | {c['filename']} | relevance={c['score']:.2f}]\n{c['text'][:1200]}"
-            )
+def build_user_prompt(issue: str, subject: str, company: str, chunks: list[dict]) -> str:
+    if chunks:
+        parts = [
+            f"[DOC {i} | {c['company']} | {c['filename']} | score={c['score']:.3f}]\n{c['text'][:1500]}"
+            for i, c in enumerate(chunks, 1)
+        ]
         corpus_text = "\n\n---\n\n".join(parts)
     else:
-        corpus_text = "(No relevant corpus documents found for this query.)"
+        corpus_text = "(No relevant corpus documents found.)"
 
     return f"""SUPPORT TICKET
 ==============
@@ -66,26 +119,22 @@ RETRIEVED CORPUS EXCERPTS
 ==========================
 {corpus_text}
 
-Produce the JSON triage output now."""
+Output ONLY valid JSON now."""
 
 
 def safe_json_parse(raw: str) -> dict:
-    """Extract JSON from model output robustly."""
-    # Strip markdown fences
     raw = re.sub(r"```json\s*", "", raw)
     raw = re.sub(r"```\s*", "", raw)
     raw = raw.strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try to find first { ... } block
         m = re.search(r"\{[\s\S]*\}", raw)
         if m:
             try:
                 return json.loads(m.group())
             except Exception:
                 pass
-    # Fallback
     return {
         "status": "escalated",
         "product_area": "Unknown",
@@ -96,61 +145,54 @@ def safe_json_parse(raw: str) -> dict:
 
 
 def validate_output(result: dict) -> dict:
-    """Ensure output has required fields with valid values."""
-    valid_status = {"replied", "escalated"}
-    valid_request_type = {"product_issue", "feature_request", "bug", "invalid"}
-
-    if result.get("status") not in valid_status:
+    if result.get("status") not in {"replied", "escalated"}:
         result["status"] = "escalated"
-    if result.get("request_type") not in valid_request_type:
+    if result.get("request_type") not in {"product_issue", "feature_request", "bug", "invalid"}:
         result["request_type"] = "product_issue"
     for field in ["product_area", "response", "justification"]:
-        if not result.get(field):
-            result[field] = "N/A"
+        if not result.get(field) or str(result[field]).strip() in ("", "N/A", "null"):
+            result[field] = "Not available"
     return result
 
 
 def triage_ticket(issue: str, subject: str, company: str) -> dict:
-    """Main entry point: triage a single support ticket."""
-    # Normalize company
-    company_norm = company.strip() if company else "None"
+    company_norm = (company or "None").strip()
 
-    # Build combined query for retrieval
+    pre = pre_escalation_check(issue, subject)
+    if pre:
+        return pre
+
     query = f"{subject or ''} {issue}".strip()
 
-    # Retrieve relevant docs
-    retriever = get_retriever(company_norm if company_norm != "None" else None)
-    chunks = retriever.retrieve(query, top_k=5)
+    if company_norm != "None":
+        chunks = get_retriever(company_norm).retrieve(query, top_k=6)
+        if not chunks:
+            chunks = get_retriever(None).retrieve(query, top_k=6)
+    else:
+        chunks = get_retriever(None).retrieve(query, top_k=6)
 
-    # If company is None and we got nothing, try all companies
-    if not chunks and company_norm == "None":
-        retriever_all = get_retriever(None)
-        chunks = retriever_all.retrieve(query, top_k=5)
+    chunks = [c for c in chunks if c["score"] > 0.01]
 
-    # Build prompts
     user_prompt = build_user_prompt(issue, subject, company_norm, chunks)
 
-    # Call Gemini
     try:
-        model_client = genai.GenerativeModel(
-            model_name=MODEL,
-            system_instruction=SYSTEM_PROMPT,
-            generation_config=genai.GenerationConfig(
-                temperature=0,
-                max_output_tokens=1000,
-            ),
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=1000,
         )
-        response = model_client.generate_content(user_prompt)
-        raw = response.text or ""
+        raw = response.choices[0].message.content
     except Exception as e:
         return {
             "status": "escalated",
             "product_area": "Unknown",
-            "response": f"Agent error: {str(e)[:100]}. Escalating to human support.",
-            "justification": f"API error during triage: {str(e)[:100]}",
+            "response": "An error occurred during triage. Escalating to human support.",
+            "justification": f"API error: {str(e)[:120]}",
             "request_type": "product_issue",
         }
 
-    result = safe_json_parse(raw)
-    result = validate_output(result)
-    return result
+    return validate_output(safe_json_parse(raw))

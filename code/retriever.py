@@ -4,6 +4,7 @@ retriever.py — Loads the local support corpus and retrieves relevant docs via 
 import os
 import glob
 from pathlib import Path
+from typing import Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
@@ -17,7 +18,7 @@ COMPANY_DIRS = {
 }
 
 
-def load_corpus(company: str | None = None) -> list[dict]:
+def load_corpus(company: Optional[str] = None) -> list[dict]:
     """Load markdown/text files from the corpus. Filter by company if given."""
     docs = []
     dirs_to_load = {}
@@ -65,7 +66,7 @@ def load_corpus(company: str | None = None) -> list[dict]:
 
 
 class CorpusRetriever:
-    def __init__(self, company: str | None = None):
+    def __init__(self, company: Optional[str] = None):
         self.docs = load_corpus(company)
         if not self.docs:
             self.vectorizer = None
@@ -100,7 +101,7 @@ class CorpusRetriever:
 _cache: dict[str, CorpusRetriever] = {}
 
 
-def get_retriever(company: str | None) -> CorpusRetriever:
+def get_retriever(company: Optional[str] = None) -> CorpusRetriever:
     key = company or "ALL"
     if key not in _cache:
         _cache[key] = CorpusRetriever(company)
